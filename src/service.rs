@@ -40,6 +40,15 @@ fn link(target: &Path, path: &Path) -> Result<()> {
     fs::rename(tmp, path)?;
     Ok(())
 }
+fn write_executable(path: &Path, bytes: &[u8]) -> Result<()> {
+    config::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
 fn unit_text(exe: &Path, data: &Path, path: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array><string>{}</string><string>--data-dir</string><string>{}</string><string>listen</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer><key>EnvironmentVariables</key><dict><key>PATH</key><string>{}</string></dict><key>StandardOutPath</key><string>{}</string><key>StandardErrorPath</key><string>{}</string></dict></plist>",
@@ -75,12 +84,7 @@ fn install_with(
     let previous_link = fs::read_link(&command).ok();
     let legacy_running = run(&["print".into(), format!("{domain}/{LEGACY_LABEL}")]);
     let current_running = run(&["print".into(), format!("{domain}/{LABEL}")]);
-    config::write(&exe, binary)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&exe, fs::Permissions::from_mode(0o700))?;
-    }
+    write_executable(&exe, binary)?;
     config::write(&unit, unit_text(&exe, data, path).as_bytes())?;
     let result = (|| -> Result<()> {
         for (label, running) in [(LEGACY_LABEL, legacy_running), (LABEL, current_running)] {
@@ -122,7 +126,7 @@ fn install_with(
             let _ = fs::remove_file(&unit);
         }
         if let Some(bytes) = previous_exe {
-            config::write(&exe, &bytes)?;
+            write_executable(&exe, &bytes)?;
         } else {
             let _ = fs::remove_file(&exe);
         }
@@ -285,5 +289,50 @@ mod tests {
             unit_text(Path::new("/tmp/a&b/shuttle"), Path::new("/tmp/a'b"), "/bin")
                 .contains("a&amp;b")
         );
+    }
+    #[test]
+    fn failed_reinstall_restores_executable_permissions_and_current_worker() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join("data");
+        let exe = data.join("bin/shuttle");
+        write_executable(&exe, b"ORIGINAL_BINARY").unwrap();
+        let unit = home
+            .path()
+            .join(format!("Library/LaunchAgents/{LABEL}.plist"));
+        config::write(&unit, b"ORIGINAL_UNIT").unwrap();
+        link(&exe, &home.path().join(".local/bin/shuttle")).unwrap();
+        let running = RefCell::new(true);
+        let starts = RefCell::new(0);
+        assert!(
+            install_with(
+                &data,
+                home.path(),
+                b"UPDATED_BINARY",
+                "/bin",
+                "gui/123",
+                |args| {
+                    if args[0] == "print" {
+                        return args[1].ends_with(LABEL) && *running.borrow();
+                    }
+                    if args[0] == "bootout" {
+                        *running.borrow_mut() = false;
+                    }
+                    if args[0] == "bootstrap" {
+                        *starts.borrow_mut() += 1;
+                        return *starts.borrow() > 1;
+                    }
+                    true
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&exe).unwrap(), b"ORIGINAL_BINARY");
+        assert_eq!(
+            fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fs::read(unit).unwrap(), b"ORIGINAL_UNIT");
+        assert_eq!(*starts.borrow(), 2);
     }
 }
